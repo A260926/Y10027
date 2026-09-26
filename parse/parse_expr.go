@@ -1,0 +1,433 @@
+package parse
+
+import "fmt"
+
+// parseExpr parses an expression.
+func (t *Tree) parseExpr() (Expr, error) {
+	expr, err := t.parseInnerExpr()
+	if err != nil {
+		return nil, err
+	}
+
+	return t.parseOuterExpr(expr)
+}
+
+// parseOuterExpr attempts to parse an expression outside of an inner
+// expression.
+// An outer expression is defined as a modification to an inner expression.
+// Examples include attribute accessing, filter application, or binary operations.
+func (t *Tree) parseOuterExpr(expr Expr) (Expr, error) {
+	switch nt := t.nextNonSpace(); nt.tokenType {
+	case tokenParensOpen:
+		switch name := expr.(type) {
+		case *NameExpr:
+			// TODO: This duplicates some code in parseInnerExpr, are both necessary?
+			return t.parseFunc(name)
+		default:
+			return nil, newUnexpectedTokenError(nt)
+		}
+
+	case tokenArrayOpen, tokenPunctuation:
+		switch nt.value {
+		case ".", "[": // Dot or array access
+			var args = make([]Expr, 0)
+			attr, err := t.parseInnerExpr()
+			if err != nil {
+				return nil, err
+			}
+
+			if nt.value == "[" {
+				ntt := t.peekNonSpace()
+				if ntt.tokenType != tokenArrayClose {
+					if attr, err = t.parseOuterExpr(attr); err != nil {
+						return nil, err
+					}
+				}
+				if _, err := t.expect(tokenArrayClose); err != nil {
+					return nil, err
+				}
+			} else {
+				switch exp := attr.(type) {
+				case *NameExpr:
+					// valid, but we want to treat the name as a string
+					attr = NewStringExpr(exp.Name, exp.Pos)
+				case *NumberExpr:
+					// Compatibility with Twig: {{ val.0 }}
+					attr = NewStringExpr(exp.Value, exp.Pos)
+				case *FuncExpr:
+					// method call
+					for _, v := range exp.Args {
+						args = append(args, v)
+					}
+					attr = NewStringExpr(exp.Name, exp.Pos)
+				default:
+					return nil, newUnexpectedTokenError(nt)
+				}
+			}
+			return t.parseOuterExpr(NewGetAttrExpr(expr, attr, args, nt.Pos))
+
+		case "|": // Filter application
+
+			// Parse the filter expression using parseInnerExpr to handle binary expressions
+			// or chained expressions
+			nx, err := t.parseInnerExpr()
+
+			if err != nil {
+				return nil, err
+			}
+
+			var resultExpr Expr
+			switch n := nx.(type) {
+			case *BinaryExpr:
+				switch b := n.Left.(type) {
+				case *NameExpr:
+					v := NewFilterExpr(b.Name, []Expr{expr}, nt.Pos)
+					n.Left = v
+					resultExpr = n
+				case *FuncExpr:
+					b.Args = append([]Expr{expr}, b.Args...)
+					v := NewFilterExpr(b.Name, b.Args, nt.Pos)
+					n.Left = v
+					resultExpr = n
+				default:
+					return nil, newUnexpectedTokenError(nt)
+				}
+			case *NameExpr:
+				resultExpr = NewFilterExpr(n.Name, []Expr{expr}, nt.Pos)
+
+			case *FuncExpr:
+				n.Args = append([]Expr{expr}, n.Args...)
+				resultExpr = NewFilterExpr(n.Name, n.Args, n.Pos)
+
+			case *FilterExpr:
+				// Handle chained filters: when parsing "filter1|filter2",
+				// filter2 might already be parsed as a FilterExpr
+				// We need to prepend the current expr to its arguments
+				n.Args = append([]Expr{expr}, n.Args...)
+				resultExpr = n
+
+			default:
+				return nil, newUnexpectedTokenError(nt)
+			}
+
+			// Continue parsing potential outer expressions (including more filters)
+			return t.parseOuterExpr(resultExpr)
+
+		case "?": // Ternary if
+			tx, err := t.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			_, err = t.expectValue(tokenPunctuation, ":")
+			if err != nil {
+				return nil, err
+			}
+			fx, err := t.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			return NewTernaryIfExpr(expr, tx, fx, expr.Start()), nil
+
+		default:
+			t.backup()
+			return expr, nil
+		}
+
+	case tokenOperator:
+		op, ok := binaryOperators[nt.value]
+		if !ok {
+			return nil, newUnexpectedTokenError(nt)
+		}
+
+		var right Node
+		var err error
+		if op.op == OpBinaryIs || op.op == OpBinaryIsNot {
+			right, err = t.parseRightTestOperand(nil)
+			if err != nil {
+				return nil, err
+			}
+			// Re-enter parseOuterExpr so any trailing operators
+			// (and/or/==/~/further tests, or a ternary `?`) are
+			// consumed. Without this, the `is` branch would return
+			// the BinaryExpr directly and leave the next token
+			// dangling for the outer parser.
+			return t.parseOuterExpr(NewBinaryExpr(expr, op.Operator(), right, expr.Start()))
+		} else {
+			right, err = t.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			if v, ok := right.(*BinaryExpr); ok {
+				nxop := binaryOperators[v.Op]
+				if nxop.precedence < op.precedence || (nxop.precedence == op.precedence && op.leftAssoc()) {
+					// Descend along the left spine as long as we keep
+					// finding operators whose precedence also qualifies
+					// for re-association. One level isn't enough when
+					// the right subtree chains 3+ operators across two
+					// precedence levels (e.g. `A in B or C in D or E in F`).
+					target := v
+					for {
+						lb, ok := target.Left.(*BinaryExpr)
+						if !ok {
+							break
+						}
+						lop := binaryOperators[lb.Op]
+						if lop.precedence < op.precedence || (lop.precedence == op.precedence && op.leftAssoc()) {
+							target = lb
+							continue
+						}
+						break
+					}
+					res := NewBinaryExpr(expr, op.Operator(), target.Left, expr.Start())
+					target.Left = res
+					return v, nil
+				}
+			}
+		}
+		return NewBinaryExpr(expr, op.Operator(), right, expr.Start()), nil
+
+	default:
+		t.backup()
+		return expr, nil
+	}
+}
+
+// parseIsRightOperand handles "is" and "is not" tests, which can
+// themselves be two words, such as "divisible by":
+//
+//	{% if 10 is divisible by(3) %}
+func (t *Tree) parseRightTestOperand(prev *NameExpr) (*TestExpr, error) {
+	right, err := t.parseInnerExpr()
+	if err != nil {
+		return nil, err
+	}
+	if prev == nil {
+		if r, ok := right.(*NameExpr); ok {
+			if nxt := t.peekNonSpace(); nxt.tokenType == tokenName {
+				return t.parseRightTestOperand(r)
+			}
+		}
+	}
+	switch r := right.(type) {
+	case *NameExpr:
+		if prev != nil {
+			r.Name = prev.Name + " " + r.Name
+		}
+		return NewTestExpr(r.Name, []Expr{}, r.Pos), nil
+
+	case *FuncExpr:
+		if prev != nil {
+			r.Name = prev.Name + " " + r.Name
+		}
+		return &TestExpr{r}, nil
+	case *NullExpr:
+		// `is null` / `is none` (and the uppercase variants) are
+		// first-class tests in PHP Twig; parseInnerExpr rewrites the
+		// null/none keywords to a NullExpr, so restore them to a
+		// TestExpr here. The canonical test name is "null" — an env's
+		// Tests map can alias "none" to the same function if both
+		// spellings should be user-visible for introspection.
+		name := "null"
+		if prev != nil {
+			name = prev.Name + " " + name
+		}
+		return NewTestExpr(name, []Expr{}, r.Pos), nil
+	default:
+		return nil, fmt.Errorf(`Expected name or function, got "%v"`, right)
+	}
+}
+
+// parseInnerExpr attempts to parse an inner expression.
+// An inner expression is defined as a cohesive expression, such as a literal.
+func (t *Tree) parseInnerExpr() (Expr, error) {
+	switch tok := t.nextNonSpace(); tok.tokenType {
+	case tokenEOF:
+		return nil, newUnexpectedEOFError(tok)
+
+	case tokenOperator:
+		op, ok := unaryOperators[tok.value]
+		if !ok {
+			return nil, newUnexpectedTokenError(tok)
+		}
+		expr, err := t.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		return NewUnaryExpr(op.Operator(), expr, tok.Pos), nil
+
+	case tokenParensOpen:
+		inner, err := t.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		_, err = t.expect(tokenParensClose)
+		if err != nil {
+			return nil, err
+		}
+		return NewGroupExpr(inner, tok.Pos), nil
+
+	case tokenHashOpen:
+		els := []*KeyValueExpr{}
+		for {
+			nxt := t.peek()
+			if nxt.tokenType == tokenHashClose {
+				t.next()
+				break
+			}
+			keyExpr, err := t.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			_, err = t.expectValue(tokenPunctuation, delimHashKeyValue)
+			if err != nil {
+				return nil, err
+			}
+			valExpr, err := t.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			els = append(els, NewKeyValueExpr(keyExpr, valExpr, nxt.Pos))
+			nxt = t.peek()
+			if nxt.tokenType == tokenPunctuation {
+				_, err := t.expectValue(tokenPunctuation, ",")
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		return NewHashExpr(tok.Pos, els...), nil
+
+	case tokenArrayOpen:
+		els := []Expr{}
+		for {
+			nxt := t.peek()
+			if nxt.tokenType == tokenArrayClose {
+				t.next()
+				break
+			}
+			expr, err := t.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			els = append(els, expr)
+			nxt = t.peek()
+			if nxt.tokenType == tokenPunctuation {
+				_, err := t.expectValue(tokenPunctuation, ",")
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		return NewArrayExpr(tok.Pos, els...), nil
+
+	case tokenNumber:
+		nxt := t.peek()
+		val := tok.value
+		if nxt.tokenType == tokenPunctuation && nxt.value == "." {
+			val = val + "."
+			t.next()
+			nxt, err := t.expect(tokenNumber)
+			if err != nil {
+				return nil, err
+			}
+			val = val + nxt.value
+		}
+		return NewNumberExpr(val, tok.Pos), nil
+
+	case tokenName:
+		switch tok.value {
+		case "null", "NULL", "none", "NONE":
+			return NewNullExpr(tok.Pos), nil
+		case "true", "TRUE":
+			return NewBoolExpr(true, tok.Pos), nil
+		case "false", "FALSE":
+			return NewBoolExpr(false, tok.Pos), nil
+		}
+		name := NewNameExpr(tok.value, tok.Pos)
+		nt := t.nextNonSpace()
+		if nt.tokenType == tokenParensOpen {
+			// TODO: This duplicates some code in parseOuterExpr, are both necessary?
+			return t.parseFunc(name)
+		}
+		t.backup()
+		return name, nil
+
+	case tokenStringOpen:
+		var exprs []Expr
+		for {
+			nxt, err := t.expect(tokenText, tokenInterpolateOpen, tokenStringClose)
+			if err != nil {
+				return nil, err
+			}
+			switch nxt.tokenType {
+			case tokenText:
+				exprs = append(exprs, NewStringExpr(nxt.value, nxt.Pos))
+			case tokenInterpolateOpen:
+				exp, err := t.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				_, err = t.expect(tokenInterpolateClose)
+				if err != nil {
+					return nil, err
+				}
+				exprs = append(exprs, exp)
+			case tokenStringClose:
+				ln := len(exprs)
+				if ln > 1 {
+					var res *BinaryExpr
+					for i := 1; i < ln; i++ {
+						if res == nil {
+							res = NewBinaryExpr(exprs[i-1], OpBinaryConcat, exprs[i], exprs[i-1].Start())
+							continue
+						}
+						res = NewBinaryExpr(res, OpBinaryConcat, exprs[i], res.Pos)
+					}
+					return res, nil
+				}
+				return exprs[0], nil
+			}
+		}
+
+	default:
+		return nil, newUnexpectedTokenError(tok)
+	}
+}
+
+// parseFunc parses a function call expression from the first argument expression until the closing parenthesis.
+func (t *Tree) parseFunc(name *NameExpr) (Expr, error) {
+	var args []Expr
+	for {
+		switch tok := t.peek(); tok.tokenType {
+		case tokenEOF:
+			return nil, newUnexpectedEOFError(tok)
+
+		case tokenParensClose:
+		// do nothing
+
+		default:
+			argexp, err := t.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+
+			args = append(args, argexp)
+		}
+
+		switch tok := t.nextNonSpace(); tok.tokenType {
+		case tokenEOF:
+			return nil, newUnexpectedEOFError(tok)
+
+		case tokenPunctuation:
+			if tok.value != "," {
+				return nil, newUnexpectedValueError(tok, ",")
+			}
+
+		case tokenParensClose:
+			return NewFuncExpr(name.Name, args, name.Pos), nil
+
+		default:
+			return nil, newUnexpectedTokenError(tok, tokenPunctuation, tokenParensClose)
+		}
+	}
+}
