@@ -2,6 +2,7 @@ package stick
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -43,7 +44,7 @@ type MemoryLoader struct {
 func (l *MemoryLoader) Load(name string) (Template, error) {
 	v, ok := l.Templates[name]
 	if !ok {
-		return nil, os.ErrNotExist
+		return nil, fmt.Errorf("stick: template %q does not exist: %w", name, os.ErrNotExist)
 	}
 	return &stringTemplate{name, v}, nil
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -198,14 +199,33 @@ func (s *state) getBlock(name string) *parse.BlockNode {
 	return nil
 }
 
-func (s *state) getParentBlock(name string) *parse.BlockNode {
-	rootFound := false
-	for _, blocks := range s.blocks {
-		if block, ok := blocks[name]; ok {
-			if rootFound {
-				return block
+// getParentBlockAfter returns the next definition of name found on the block
+// stack strictly below from. The block stack is ordered root-most first
+// (execute appends the root tree's blocks; each {% extends %} appends the
+// parent tree's blocks), so getBlock resolves to the definition nearest
+// the leaf. parent() inside an overriding block must resolve to the
+// definition that block overrides — in a three-level chain
+// (base ← mid ← leaf) the leaf block's parent() resolves to mid, and mid's
+// parent() resolves to base.
+//
+// The previous implementation only skipped the first match globally, so
+// parent() invoked from a parent block re-resolved to that same block and
+// recursed until the stack overflowed. Matching by pointer is unambiguous
+// because parsing constructs a fresh BlockNode per definition (this also
+// handles same-name blocks contributed by embed/use scopes).
+func (s *state) getParentBlockAfter(from *parse.BlockNode, name string) *parse.BlockNode {
+	start := 0
+	if from != nil {
+		for i, blocks := range s.blocks {
+			if blocks[name] == from {
+				start = i + 1
+				break
 			}
-			rootFound = true
+		}
+	}
+	for i := start; i < len(s.blocks); i++ {
+		if block, ok := s.blocks[i][name]; ok {
+			return block
 		}
 	}
 	return nil
@@ -367,6 +387,13 @@ func (s *state) walkChild(node parse.Node) error {
 		// Twig spec says these run and are visible in blocks. Execute in
 		// the current scope so the parent walk finds the value.
 		return s.walkSetNode(node)
+	case *parse.ImportNode:
+		// {% import %} / {% from import %} at the top level of a child
+		// template bind macro names into the shared scope before the parent
+		// root is walked; the parent's blocks must be able to call them.
+		return s.walkImportNode(node)
+	case *parse.FromNode:
+		return s.walkFromNode(node)
 	default:
 		// No need to handle other nodes. This function only populates blocks from a
 		// referenced template (in a use statement) and does not actually execute anything.
@@ -429,12 +456,17 @@ func (s *state) walkForNode(node *parse.ForNode) error {
 // The template expression may evaluate to a single name or an array of
 // candidate names. This method picks the first candidate whose template the
 // env's Loader can resolve and returns that name. If none resolve:
-//   - if node.IgnoreMissing is true, returns "" with a nil error so the
-//     caller can skip rendering;
-//   - otherwise, returns the last loader error.
+//   - if node.IgnoreMissing is true and every failure was a not-exist
+//     loader error, returns "" with a nil error so the caller can skip
+//     rendering;
+//   - otherwise, returns the last loader error, unwrapped so the loader's
+//     cause and template path survive.
 //
-// Loader-level errors are the only errors swallowed by IgnoreMissing. Errors
-// from parsing or executing a successfully-loaded template still propagate.
+// Matching PHP-Twig's `ignore missing`, only missing templates are
+// swallowed: any other loader error (permission denied, I/O failure, a
+// loader that rejects a name structurally) aborts immediately regardless
+// of IgnoreMissing. Errors from parsing or executing a successfully-loaded
+// template still propagate in the caller regardless.
 func (s *state) walkIncludeNode(node *parse.IncludeNode) (tpl string, ctx map[string]Value, err error) {
 	ctx = make(map[string]Value)
 	v, err := s.evalExpr(node.Tpl)
@@ -465,6 +497,13 @@ func (s *state) walkIncludeNode(node *parse.IncludeNode) (tpl string, ctx map[st
 			tpl = cand
 			break
 		} else {
+			if !errors.Is(lerr, os.ErrNotExist) {
+				// A structural loader failure is never hidden behind
+				// "ignore missing". The loader error already identifies the
+				// candidate path and its underlying cause (see
+				// MemoryLoader/FilesystemLoader), so pass it through.
+				return "", nil, lerr
+			}
 			lastErr = lerr
 		}
 	}
@@ -946,15 +985,31 @@ func (s *state) evalFunction(exp *parse.FuncExpr) (Value, error) {
 			return nil, errors.New("not inside a block!")
 		}
 		name := s.current.Name
-		if blk := s.getParentBlock(name); blk != nil {
+		if blk := s.getParentBlockAfter(s.current, name); blk != nil {
 			pout := s.out
 			buf := &bytes.Buffer{}
 			s.out = buf
+			// Render the parent definition as if its own {% block %} node
+			// had been walked: track it as the current block so a nested
+			// parent() resolves one level further up instead of looping
+			// back, and switch s.name to its origin for Meta/Context users.
+			prev := s.current
+			s.current = blk
+			defer func() { s.current = prev }()
+			if blk.Origin != "" {
+				defer func(name string) { s.name = name }(s.name)
+				s.name = blk.Origin
+			}
 			if err := s.walk(blk.Body); err != nil {
 				return nil, err
 			}
 			s.out = pout
-			return buf.String(), nil
+			// A parent block is template-authored markup: it was already
+			// autoescaped at its own PrintNodes, so the buffered result is
+			// trusted for every strategy and must not be escaped a second
+			// time when the child prints parent() (mirrors PHP-Twig's
+			// Twig\Markup result of parent()).
+			return newTrustedMarkup(buf.String()), nil
 		}
 		return nil, errors.New("Unable to locate block \"" + name + "\"")
 	case "block":
@@ -976,7 +1031,7 @@ func (s *state) evalFunction(exp *parse.FuncExpr) (Value, error) {
 				return nil, err
 			}
 			s.out = pout
-			return buf.String(), nil
+			return newTrustedMarkup(buf.String()), nil
 		}
 		return nil, errors.New("Unable to locate block \"" + name + "\"")
 	}
@@ -1035,6 +1090,23 @@ type macroSet struct {
 	defs map[string]macroDef
 }
 
+// trustedMarkupTypes are the content strategies for which template-authored
+// output (macro results, parent()/block() buffers) is trusted. PHP-Twig
+// wraps such output in a Twig\Markup that every core escaper treats as
+// already safe; the list mirrors the AutoEscapeExtension's built-in
+// escapers (html, html_attr, js, css, url). The core package owns the
+// SafeValue abstraction, so it also owns this canonical strategy set
+// rather than importing the twig subpackage.
+var trustedMarkupTypes = []string{"html", "html_attr", "js", "css", "url"}
+
+// newTrustedMarkup marks engine-rendered template output as already
+// escaped. Markup produced by walking template nodes was autoescaped at
+// each of its own PrintNodes; wrapping the buffer stops a surrounding
+// PrintNode from escaping it a second time.
+func newTrustedMarkup(s string) SafeValue {
+	return NewSafeValue(s, trustedMarkupTypes...)
+}
+
 func (s *state) callMacro(macro macroDef, args ...Value) (Value, error) {
 	s.scope.push()
 	defer s.scope.pop()
@@ -1060,7 +1132,13 @@ func (s *state) callMacro(macro macroDef, args ...Value) (Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	return buf.String(), nil
+	// The macro rendered template-authored markup; its own PrintNodes were
+	// escaped as required by the macro's origin strategy. Returning a plain
+	// string made the call site's autoescape run twice over the same bytes
+	// (literal tags like <b> became &lt;b&gt; and arguments ended up double
+	// encoded). Safe for all strategies because template authors, not data,
+	// control macro output — same contract as PHP-Twig's macro return.
+	return newTrustedMarkup(buf.String()), nil
 }
 
 // execute kicks off execution of the given template.

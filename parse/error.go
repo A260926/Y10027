@@ -19,12 +19,17 @@ type DebugError interface {
 }
 
 type parseError struct {
-	Pos
+	pos  Pos
 	name string // The template this error occurred in.
 }
 
 func newParseError(p Pos) parseError {
-	return parseError{p, ""}
+	return parseError{pos: p}
+}
+
+// Pos returns the position where the error originated.
+func (e *parseError) Pos() Pos {
+	return e.pos
 }
 
 func (e *parseError) Name() string {
@@ -38,9 +43,9 @@ func (e *parseError) setTree(t *Tree) {
 func (e *parseError) sprintf(format string, a ...interface{}) string {
 	res := fmt.Sprintf(format, a...)
 	if e.name == "" {
-		return fmt.Sprintf("parse: %s on line %d, column %d", res, e.Line, e.Offset)
+		return fmt.Sprintf("parse: %s on line %d, column %d", res, e.pos.Line, e.pos.Offset)
 	}
-	return fmt.Sprintf("parse: %s on line %d, column %d in %s", res, e.Line, e.Offset, e.name)
+	return fmt.Sprintf("parse: %s on line %d, column %d in %s", res, e.pos.Line, e.pos.Offset, e.name)
 }
 
 // UnexpectedTokenError is generated when the current token
